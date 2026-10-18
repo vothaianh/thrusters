@@ -207,6 +207,7 @@
     <button type="submit">LET'S GO ▶</button>
   </form>
 </div>
+<script src="/sim.js?v=1"></script>
 <script>
 (() => {
 'use strict';
@@ -480,16 +481,20 @@ async function fetchLeaderboard() {
   } catch {}
 }
 
-async function submitScore(finalScore, duration) {
+// the server replays the run from its seed and our inputs and scores it itself
+async function submitScore() {
   if (!profile) return;
+  if (!run) { submitState = 'offline'; return; }
   submitState = 'sending';
   try {
     const r = await fetch('/api/score', {
       method: 'POST', headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ name: profile.name, email: profile.email, score: finalScore, duration }),
+      body: JSON.stringify({ run: run.id, name: profile.name, email: profile.email, key: store.get('thrusters.key', ''),
+        inputs, steps: G.steps, v: Sim.VERSION }),
     });
     const d = await r.json();
     if (!r.ok) { submitState = d.error || 'error'; return; }
+    if (d.key) store.set('thrusters.key', d.key);
     myId = d.you; store.set('thrusters.id', myId);
     lastRank = d.rank; submitState = 'ok';
     if (d.best > best) { best = d.best; store.set('thrusters.best', String(best)); }
@@ -633,19 +638,23 @@ fetchLeaderboard();
 setInterval(() => { if (!document.hidden) fetchLeaderboard(); }, 20000);
 
 // ---------- game state ----------
+// Gameplay runs in sim.js (G) so the server can replay a run and verify its score; this file adds visuals and sound.
+const Sim = window.ThrustersSim;
 let state = 'menu';         // menu | play | dead
-let dist = 0, speed = 380, grav = 4200, level = 0;
-let score = 0, bonus = 0, combo = 0, comboT = 0, cells = 0;
+let G = Sim.create(1, onSim, true);
+// mirrored from G every frame for the drawing code (see sync)
+let dist = 0, speed = 300, level = 0, score = 0, combo = 0, comboT = 0, cells = 0, invuln = 0, nitroK = 0;
 let best = Number(store.get('thrusters.best', '0')) || 0;
 let newBest = false, deadT = 0, deathMsg = '', timeScale = 1;
 let shake = 0, flash = 0, flashColor = '#fff', tAll = 0, menuFlipT = 1.2;
-let nextX = 0, buffer = 0, invuln = 0, runTime = 0, lastRank = 0, submitState = '';
+let acc = 0, lastRank = 0, submitState = '';
+let run = null, nextRun = null, inputs = []; // server-issued run (seed) and the steps at which the button was pressed
 // timed power-ups: NITRO = speed (x1.6, double distance score, phase through hazards), TITAN = strength (smash hazards)
 const BUFFS = {
-  nitro: { dur: 4, color: '#ff8a00', name: 'NITRO', label: 'NITRO ×2' },
-  titan: { dur: 6, color: '#ff2bd6', name: 'TITAN', label: 'TITAN SMASH' },
+  nitro: { dur: Sim.BUFF_DUR.nitro, color: '#ff8a00', name: 'NITRO', label: 'NITRO ×2' },
+  titan: { dur: Sim.BUFF_DUR.titan, color: '#ff2bd6', name: 'TITAN', label: 'TITAN SMASH' },
 };
-let buffs = { nitro: 0, titan: 0 }, nitroK = 0, lastBuffX = 0;
+let buffs = G.buffs;
 // cheering avatar shown while a buff is active
 const CHEERS = {
   nitro: ['LUDICROUS SPEED!', 'FULL THRUST!', "LET'S GOOO!"],
@@ -658,88 +667,98 @@ let avatarReady = false;
 avatarImg.onload = () => { avatarReady = true; };
 avatarImg.src = '/img/musk.jpg';
 const P = { y: BOT - CAT_H, vy: 0, dir: 1, grounded: true, vis: 1, run: 0, shield: false, squash: 0 };
-let objs = [], parts = [], pops = [], trail = [], smoke = [];
+let objs = G.objs, parts = [], pops = [], trail = [], smoke = [];
 
 const DEATH_MSGS = ['TOTALED!', '0–96 IN 0.8s… INTO SPIKES', 'NOT AI-GENERATED. REAL CRASH.', 'SEE YOU IN 2028', 'STEER-BY-WIRE, NOT BY LUCK', 'RECALL NOTICE', 'BACK TO THE GIGAFACTORY'];
 
 function reset() {
-  dist = 0; speed = 380; level = 0; score = 0; bonus = 0; combo = 0; comboT = 0; cells = 0;
-  newBest = false; timeScale = 1; nextX = 700; buffer = 0; invuln = 0; runTime = 0; lastRank = 0; submitState = '';
-  buffs = { nitro: 0, titan: 0 }; nitroK = 0; lastBuffX = 0; cheerK = 0;
-  Object.assign(P, { y: BOT - CAT_H, vy: 0, dir: 1, grounded: true, vis: 1, shield: false, squash: 0 });
-  objs = []; parts = []; pops = []; trail = []; smoke = [];
+  newBest = false; timeScale = 1; acc = 0; lastRank = 0; submitState = ''; cheerK = 0;
+  Object.assign(P, { vis: 1, squash: 0 });
+  parts = []; pops = []; trail = []; smoke = [];
 }
 
 function start() {
   reset();
+  run = nextRun && Date.now() - nextRun.at < 2.5 * 3600e3 ? nextRun : null; // null (offline): playable, not ranked
+  nextRun = null;
+  fetchRun(); // ready for the next game
+  G = Sim.create(run ? run.seed : (Math.random() * 2 ** 32) >>> 0, onSim);
+  inputs = [];
+  sync();
   state = 'play';
   document.body.classList.add('playing');
   if (musicGain) musicGain.gain.setTargetAtTime(0.32, AC.currentTime, 0.1);
   flash = 0.5; flashColor = '#00e5ff';
 }
 
-// ---------- level generation ----------
-function flipDistance() {
-  const s = speed + 120, g = 4200 * (s / 380);
-  return s * Math.sqrt(2 * (2 * HALF - 2 * CAT_H) / g);
+// copy the sim state the drawing code reads
+function sync() {
+  ({ dist, speed, level, score, combo, comboT, cells, invuln, nitroK, buffs, objs } = G);
+  Object.assign(P, G.P);
 }
 
-function addSpike(x, w, side) { objs.push({ t: 'spike', x, w, side }); }
-function addCell(x, y) { objs.push({ t: 'cell', x, y, ph: Math.random() * 6 }); }
+async function fetchRun() {
+  try {
+    const r = await fetch('/api/run', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ wd: navigator.webdriver === true }),
+    });
+    if (!r.ok) return;
+    const d = await r.json();
+    nextRun = { id: d.id, seed: d.seed, at: Date.now() };
+  } catch {}
+}
+fetchRun();
 
-function generate() {
-  while (nextX < dist + W + 300) {
-    const d = clamp(dist / 45000, 0, 1);
-    const gap = flipDistance() + 70 + speed * 0.24;
-    const r = Math.random();
-    const side = Math.random() < 0.5 ? 1 : -1;
-    const railY = s => (s > 0 ? BOT - CAT_H : TOP + CAT_H);
-
-    if (dist > 1800 && nextX - lastBuffX > 4200 && Math.random() < 0.09) { // random buff
-      const kind = Math.random() < 0.5 ? 'nitro' : 'titan';
-      objs.push({ t: 'buff', kind, x: nextX + 40, y: MID + side * rand(0, 60), ph: Math.random() * 6 });
-      lastBuffX = nextX; nextX += gap;
-      continue;
-    }
-
-    if (r < 0.28) { // single spike + reward cells on the safe rail
-      const w = rand(60, 130 + 160 * d);
-      addSpike(nextX, w, side);
-      for (let x = 20; x < w; x += 44) addCell(nextX + x, railY(-side));
-      nextX += w + gap * rand(1.0, 1.6);
-    } else if (r < 0.52) { // zig-zag spikes, forced flips
-      const n = 2 + Math.floor(rand(0, 1 + d * 3));
-      let s = side;
-      for (let i = 0; i < n; i++) {
-        const w = rand(50, 100 + 60 * d);
-        addSpike(nextX, w, s);
-        nextX += w + gap * rand(1.0, 1.25 - d * 0.15);
-        s = -s;
-      }
-      nextX += gap * 0.4;
-    } else if (r < 0.7) { // saw in the middle: time your flip
-      const amp = rand(10, 30 + 30 * d);
-      objs.push({ t: 'saw', x: nextX + 30, y: MID, r: 22, amp, f: rand(1.5, 3 + d * 2), ph: rand(0, 6), rot: 0 });
-      if (Math.random() < 0.5 + d * 0.3) addSpike(nextX - 40, 140, side);
-      nextX += 60 + gap * 1.2;
-    } else if (r < 0.86) { // diagonal cell line: collect it mid-flip
-      const fd = flipDistance(), from = railY(side), to = railY(-side);
-      for (let i = 0; i <= 5; i++) {
-        const k = i / 5;
-        addCell(nextX + k * fd, lerp(from, to, k * k));
-      }
-      nextX += fd + gap * 0.8;
-    } else if (r < 0.94 && dist > 3000) { // long spike tunnel with alternating saws
-      const w = rand(220, 340);
-      addSpike(nextX, w, side);
-      objs.push({ t: 'saw', x: nextX + w / 2, y: MID, r: 20, amp: 18, f: 2.5, ph: 0, rot: 0 });
-      nextX += w + gap * 1.3;
-    } else { // rocket = thruster shield
-      if (!P.shield && dist > 2500) objs.push({ t: 'rocket', x: nextX + 40, y: MID + side * 50, ph: 0 });
-      else addCell(nextX + 40, MID);
-      nextX += gap;
-    }
-  }
+// visuals and sound for gameplay events from the sim
+function onSim(ev, d) {
+  const sx = o => o.x - G.dist + CX, y = G.P.y, dir = G.P.dir;
+  if (ev === 'flip') {
+    if (state === 'play') { burst(CX, y + -dir * CAT_H, 8, ['#00e5ff', '#ffffff'], 160, 0.35, 2.5, 0); sfx.flip(dir); }
+    liftoffSmoke(-dir);
+  } else if (ev === 'land') {
+    const rail = y + dir * CAT_H;
+    P.squash = 1;
+    burst(CX, rail, 10, [railColor(), '#ffffff'], 200, 0.4, 2.5, -dir * 300);
+    smokeCloud(CX, rail, -dir, 18, 1.15);
+    if (AC && state === 'play') noise(0.6, 0.2, 0, master, 'lowpass', 350);
+    shake = Math.max(shake, 3);
+    if (state === 'play') sfx.land();
+  } else if (ev === 'level') {
+    flash = 0.35; flashColor = railColor(); sfx.level();
+    pop(W / 2, MID - 6, 'SPEED UP!', railColor(), 34);
+  } else if (ev === 'buffEnd') {
+    pop(CX, y - 40, BUFFS[d].name + ' OVER', '#c9a6ff', 14);
+  } else if (ev === 'smash') {
+    shake = Math.max(shake, 9);
+    burst(CX + d.dx, d.y, 30, ['#ff4b3b', '#ff2bd6', '#ffffff', '#ffe600'], 440, 0.8, 4.5, 500);
+    pop(CX + d.dx, d.y - 30, 'SMASH +50', '#ff2bd6', 18);
+    sfx.smash();
+  } else if (ev === 'shieldBreak') {
+    shake = 10; flash = 0.4; flashColor = '#00e5ff';
+    burst(CX, y, 40, ['#00e5ff', '#ffffff', '#8a5bff'], 380, 0.8, 3.5, 0);
+    pop(CX, y - 40, 'SHIELD BROKEN', '#00e5ff', 18);
+    sfx.shieldBreak();
+  } else if (ev === 'buff') {
+    const b = BUFFS[d.kind], x = sx(d);
+    cheerKind = d.kind; cheerT = 0;
+    cheerMsg = CHEERS[d.kind][(Math.random() * CHEERS[d.kind].length) | 0];
+    burst(x, d.y, 36, [b.color, '#ffffff', '#ffe600'], 340, 0.8, 4, 0);
+    pop(x, d.y - 34, b.label + '!', b.color, 24);
+    flash = 0.35; flashColor = b.color; shake = Math.max(shake, 6);
+    sfx[d.kind]();
+  } else if (ev === 'cell') {
+    const x = sx(d.o);
+    burst(x, d.o.y, 14, ['#ffe600', '#ff8a00', '#ffffff'], 220, 0.5, 3, 0);
+    pop(x, d.o.y - 24, '+' + d.pts, G.combo >= 5 ? '#2bff88' : '#ffe600', 16 + Math.min(G.combo, 10));
+    sfx.cell(G.combo);
+  } else if (ev === 'rocket') {
+    const x = sx(d);
+    burst(x, d.y, 30, ['#ffd23f', '#ffffff', '#00e5ff'], 300, 0.7, 3.5, 0);
+    pop(x, d.y - 30, 'THRUSTER SHIELD!', '#ffd23f', 22);
+    flash = 0.3; flashColor = '#ffd23f';
+    sfx.rocket();
+  } else if (ev === 'die') die();
 }
 
 // ---------- particles ----------
@@ -792,27 +811,17 @@ function action() {
   initAudio();
   if (!profile && state !== 'play') return openModal(true);
   if (state === 'menu') start();
-  else if (state === 'play') flip();
+  else if (state === 'play') { inputs.push(G.steps); G.press(); } // recorded for the server's replay
   else if (state === 'dead' && deadT > 0.7) start();
 }
 
-function flip() {
-  if (!P.grounded) { buffer = 0.14; return; }
-  P.dir *= -1;
-  P.grounded = false;
-  P.vy = P.dir * 140;
-  buffer = 0;
-  burst(CX, P.y + -P.dir * CAT_H, 8, ['#00e5ff', '#ffffff'], 160, 0.35, 2.5, 0);
-  liftoffSmoke(-P.dir);
-  sfx.flip(P.dir);
-}
-
+// synthetic events (scripts calling dispatchEvent) don't play the game
 addEventListener('keydown', e => {
-  if (e.repeat || modalOpen || playersOpen || e.target.closest?.('button, input')) return;
+  if (!e.isTrusted || e.repeat || modalOpen || playersOpen || e.target.closest?.('button, input')) return;
   if (['Space', 'ArrowUp', 'ArrowDown', 'KeyW', 'KeyS', 'Enter'].includes(e.code)) { e.preventDefault(); action(); }
   else if (e.code === 'KeyM') { initAudio(); setMuted(!muted); }
 });
-cv.addEventListener('pointerdown', e => { e.preventDefault(); action(); });
+cv.addEventListener('pointerdown', e => { e.preventDefault(); if (e.isTrusted) action(); });
 muteBtn.addEventListener('click', e => { e.stopPropagation(); initAudio(); setMuted(!muted); });
 muteBtn.addEventListener('pointerdown', e => e.stopPropagation());
 addEventListener('resize', resize);
@@ -823,32 +832,16 @@ document.addEventListener('visibilitychange', () => {
 });
 
 // ---------- update ----------
-function obstacleHit(o, x, y) {
-  if (buffs.titan > 0) { // strength: plough straight through
-    o.broken = true; bonus += 50; shake = Math.max(shake, 9);
-    burst(x, y, 30, ['#ff4b3b', '#ff2bd6', '#ffffff', '#ffe600'], 440, 0.8, 4.5, 500);
-    pop(x, y - 30, 'SMASH +50', '#ff2bd6', 18);
-    sfx.smash();
-  } else if (buffs.nitro <= 0) hit(); // nitro phases through hazards
-}
-
-function hit() {
-  if (invuln > 0) return;
-  if (P.shield) {
-    P.shield = false; invuln = 1.0; shake = 10; flash = 0.4; flashColor = '#00e5ff';
-    burst(CX, P.y, 40, ['#00e5ff', '#ffffff', '#8a5bff'], 380, 0.8, 3.5, 0);
-    pop(CX, P.y - 40, 'SHIELD BROKEN', '#00e5ff', 18);
-    sfx.shieldBreak();
-    return;
-  }
+function die() {
   state = 'dead'; deadT = 0; timeScale = 0.25;
+  sync();
   document.body.classList.remove('playing');
   shake = 22; flash = 0.9; flashColor = '#ff2b6a';
   deathMsg = DEATH_MSGS[(Math.random() * DEATH_MSGS.length) | 0];
   burst(CX, P.y, 70, SPARKS, 520, 1.4, 4.5, 300);
   burst(CX, P.y, 20, ['#ffffff'], 700, 0.5, 2, 0);
   if (score > best) { best = score; newBest = true; store.set('thrusters.best', String(best)); }
-  submitScore(score, Math.max(0.1, Math.round(runTime * 10) / 10));
+  submitScore();
   if (musicGain) musicGain.gain.setTargetAtTime(0.08, AC.currentTime, 0.2);
   sfx.die();
 }
@@ -857,31 +850,29 @@ function update(dt) {
   tAll += dt;
   const sdt = dt * timeScale;
   if (state === 'dead') { deadT += dt; timeScale = lerp(timeScale, 1, dt * 1.5); }
+  if (state === 'play') cheerT += dt;
 
-  // pace
-  const playing = state === 'play';
-  if (playing) {
-    runTime += dt;
-    nitroK = lerp(nitroK, buffs.nitro > 0 ? 1 : 0, Math.min(1, dt * 4));
-    cheerT += dt;
-    speed = Math.min(380 + dist * 0.0115, 980) * (1 + 0.6 * nitroK);
-    const lv = Math.floor(dist / 7000);
-    if (lv > level) {
-      level = lv; flash = 0.35; flashColor = railColor(); sfx.level();
-      pop(W / 2, MID - 6, 'SPEED UP!', railColor(), 34);
-    }
-  } else if (state === 'menu') speed = 300;
-  grav = 4200 * (speed / 380);
-  if (state !== 'dead') dist += speed * sdt;
-
-  // player physics
   if (state !== 'dead') {
+    // fixed-step simulation (the server replays exactly these steps)
+    acc += dt;
+    while (acc >= Sim.STEP && state !== 'dead') { G.step(); acc -= Sim.STEP; }
+    // menu demo: auto flip
+    if (state === 'menu') {
+      menuFlipT -= dt;
+      if (menuFlipT <= 0 && G.P.grounded) { G.press(); menuFlipT = rand(0.8, 1.8); }
+    }
+  }
+
+  if (state !== 'dead') {
+    sync();
+    // draw the leftover fraction of a step ahead, so motion stays smooth on any refresh rate
+    dist += speed * acc;
+    if (!P.grounded) P.y = clamp(P.y + P.vy * acc, TOP + CAT_H, BOT - CAT_H);
+
     P.run += sdt * speed * 0.05;
     if (!P.grounded) {
       if (Math.random() < 0.85) parts.push({ x: CX - 30, y: P.y + rand(-2, 2), vx: rand(-280, -140), vy: rand(-30, 30),
         life: 0.35, max: 0.35, c: Math.random() < 0.5 ? '#00e5ff' : '#ffffff', s: rand(1.5, 3), g: 0 });
-      P.vy += grav * P.dir * sdt;
-      P.y += P.vy * sdt;
       const target = P.dir > 0 ? BOT - CAT_H : TOP + CAT_H;
       const rail = target + P.dir * CAT_H, gapToRail = Math.abs(rail - P.y);
       // retro-thrust: as the car nears the rail, its underbody jets blast smoke off the surface
@@ -890,88 +881,12 @@ function update(dt) {
         for (const jx of [-22, 22]) puff(CX + jx + rand(-4, 4), rail - P.dir * 4,
           (jx < 0 ? -1 : 1) * rand(60, 220) * k + rand(-30, 30), -P.dir * rand(10, 60), rand(4, 8), rand(25, 45), rand(0.5, 1.0), 0.45 * k + 0.1);
       }
-      if ((P.dir > 0 && P.y >= target) || (P.dir < 0 && P.y <= target)) {
-        P.y = target; P.vy = 0; P.grounded = true; P.squash = 1;
-        burst(CX, target + P.dir * CAT_H, 10, [railColor(), '#ffffff'], 200, 0.4, 2.5, -P.dir * 300);
-        smokeCloud(CX, rail, -P.dir, 18, 1.15);
-        if (AC && state === 'play') noise(0.6, 0.2, 0, master, 'lowpass', 350);
-        shake = Math.max(shake, 3);
-        if (state === 'play') sfx.land();
-        if (buffer > 0) flip();
-      }
     }
-    buffer = Math.max(0, buffer - sdt);
     P.vis = lerp(P.vis, P.dir, Math.min(1, sdt * 16));
     P.squash = Math.max(0, P.squash - sdt * 5);
-    invuln = Math.max(0, invuln - sdt);
 
     trail.push({ x: dist, y: P.y, v: P.vis });
     while (trail.length && dist - trail[0].x > CX + 40) trail.shift();
-  }
-
-  // menu demo: auto flip
-  if (state === 'menu') {
-    menuFlipT -= dt;
-    if (menuFlipT <= 0 && P.grounded) { P.dir *= -1; P.grounded = false; P.vy = P.dir * 140; liftoffSmoke(-P.dir); menuFlipT = rand(0.8, 1.8); }
-  }
-
-  if (playing) {
-    generate();
-    for (const k in buffs) {
-      if (buffs[k] <= 0) continue;
-      buffs[k] -= sdt;
-      if (buffs[k] <= 0) { buffs[k] = 0; invuln = Math.max(invuln, 0.8); pop(CX, P.y - 40, BUFFS[k].name + ' OVER', '#c9a6ff', 14); }
-    }
-    if (buffs.nitro > 0) bonus += speed * sdt / 10; // double distance points
-    score = Math.floor(dist / 10 + bonus);
-    comboT -= sdt;
-    if (comboT <= 0) combo = 0;
-
-    const cx = CX, cy = P.y, hw = 22, hh = 9;
-    for (const o of objs) {
-      const sx = o.x - dist + CX;
-      if (o.broken) continue;
-      if (o.t === 'spike') {
-        if (sx + o.w < cx - hw || sx > cx + hw) continue;
-        const y0 = o.side > 0 ? BOT - 16 : TOP, y1 = o.side > 0 ? BOT : TOP + 16;
-        if (sx + 5 < cx + hw && sx + o.w - 5 > cx - hw && y0 < cy + hh && y1 > cy - hh) obstacleHit(o, cx + 10, (y0 + y1) / 2);
-      } else if (o.t === 'saw') {
-        o.rot += sdt * 9;
-        const oy = o.y + Math.sin(tAll * o.f + o.ph) * o.amp;
-        const nx = clamp(sx, cx - hw, cx + hw), ny = clamp(oy, cy - hh, cy + hh);
-        if ((nx - sx) ** 2 + (ny - oy) ** 2 < (o.r - 4) ** 2) obstacleHit(o, sx, oy);
-      } else if (o.t === 'buff' && !o.got) {
-        if ((sx - cx) ** 2 + (o.y + Math.sin(tAll * 3 + o.ph) * 8 - cy) ** 2 < 36 * 36) {
-          const b = BUFFS[o.kind];
-          o.got = true; buffs[o.kind] = b.dur;
-          cheerKind = o.kind; cheerT = 0;
-          cheerMsg = CHEERS[o.kind][(Math.random() * CHEERS[o.kind].length) | 0];
-          burst(sx, o.y, 36, [b.color, '#ffffff', '#ffe600'], 340, 0.8, 4, 0);
-          pop(sx, o.y - 34, b.label + '!', b.color, 24);
-          flash = 0.35; flashColor = b.color; shake = Math.max(shake, 6);
-          sfx[o.kind]();
-        }
-      } else if (o.t === 'cell' && !o.got) {
-        if ((sx - cx) ** 2 + (o.y - cy) ** 2 < 28 * 28) {
-          o.got = true; cells++;
-          combo = Math.min(combo + 1, 20); comboT = 1.6;
-          const pts = 10 * combo; bonus += pts;
-          burst(sx, o.y, 14, ['#ffe600', '#ff8a00', '#ffffff'], 220, 0.5, 3, 0);
-          pop(sx, o.y - 24, '+' + pts, combo >= 5 ? '#2bff88' : '#ffe600', 16 + Math.min(combo, 10));
-          sfx.cell(combo);
-        }
-      } else if (o.t === 'rocket' && !o.got) {
-        if ((sx - cx) ** 2 + (o.y + Math.sin(tAll * 3) * 10 - cy) ** 2 < 34 * 34) {
-          o.got = true; P.shield = true;
-          burst(sx, o.y, 30, ['#ffd23f', '#ffffff', '#00e5ff'], 300, 0.7, 3.5, 0);
-          pop(sx, o.y - 30, 'THRUSTER SHIELD!', '#ffd23f', 22);
-          flash = 0.3; flashColor = '#ffd23f';
-          sfx.rocket();
-        }
-      }
-      if (state !== 'play') break;
-    }
-    objs = objs.filter(o => o.x + (o.w || 40) - dist + CX > -80);
   }
 
   for (const p of parts) { p.vy += p.g * sdt; p.x += p.vx * sdt; p.y += p.vy * sdt; p.life -= sdt; if (state !== 'dead') p.x -= speed * sdt * 0.4; }
@@ -990,7 +905,7 @@ function update(dt) {
   flash = Math.max(0, flash - dt * 1.8);
 }
 
-function railColor() { return `hsl(${(190 + level * 47) % 360} 100% 60%)`; }
+function railColor() { return `hsl(${(190 + G.level * 47) % 360} 100% 60%)`; }
 
 // ---------- drawing ----------
 function glow(c, b) { ctx.shadowColor = c; ctx.shadowBlur = b; }
@@ -1268,7 +1183,7 @@ function drawObjects() {
       ctx.fill(); ctx.stroke();
       noGlow();
     } else if (o.t === 'saw') {
-      const oy = o.y + Math.sin(tAll * o.f + o.ph) * o.amp;
+      const oy = o.y + Sim.sin(G.t * o.f + o.ph) * o.amp;
       ctx.save(); ctx.translate(sx, oy); ctx.rotate(o.rot || tAll * 9);
       glow('#ff2bd6', 18);
       ctx.fillStyle = '#2a0024'; ctx.strokeStyle = '#ff2bd6'; ctx.lineWidth = 2.2;
@@ -1294,7 +1209,7 @@ function drawObjects() {
       noGlow();
       ctx.restore();
     } else if (o.t === 'buff' && !o.got) {
-      const b = BUFFS[o.kind], y = o.y + Math.sin(tAll * 3 + o.ph) * 8;
+      const b = BUFFS[o.kind], y = o.y + Sim.sin(G.t * 3 + o.ph) * 8;
       ctx.save(); ctx.translate(sx, y);
       ctx.globalCompositeOperation = 'lighter';
       ctx.globalAlpha = 0.3 + 0.2 * Math.sin(tAll * 6);
@@ -1321,7 +1236,7 @@ function drawObjects() {
       text(b.name, sx, y + 31, 10, b.color, 'center', 900);
     } else if (o.t === 'rocket' && !o.got) {
       // thruster pack pickup: small white rocket with flame
-      const y = o.y + Math.sin(tAll * 3) * 10;
+      const y = o.y + Sim.sin(G.t * 3) * 10;
       ctx.save(); ctx.translate(sx, y); ctx.rotate(-0.5 + Math.sin(tAll * 5) * 0.12);
       ctx.globalCompositeOperation = 'lighter';
       ctx.fillStyle = 'rgba(0,229,255,0.8)';

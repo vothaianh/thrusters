@@ -5,6 +5,7 @@ const path = require('path');
 const zlib = require('zlib');
 const crypto = require('crypto');
 const { Pool } = require('pg');
+const Sim = require('./public/sim.js');
 
 const PORT = Number(process.env.PORT) || 3030;
 const HOST = process.env.HOST || '127.0.0.1';
@@ -51,6 +52,17 @@ async function initDb() {
       first_seen TIMESTAMPTZ NOT NULL DEFAULT now(), last_seen TIMESTAMPTZ NOT NULL DEFAULT now(),
       PRIMARY KEY (email, ip_hash));
     CREATE INDEX IF NOT EXISTS player_visitors_ip ON player_visitors (ip_hash);
+    -- a key kept in the player's browser; only its holder can rename the player
+    ALTER TABLE players ADD COLUMN IF NOT EXISTS key_hash TEXT;
+    -- hidden from the leaderboard (set by hand for cheaters)
+    ALTER TABLE players ADD COLUMN IF NOT EXISTS banned BOOLEAN NOT NULL DEFAULT false;
+    -- every game is a server-issued run; its score comes from replaying the inputs from its seed
+    CREATE TABLE IF NOT EXISTS runs (
+      id TEXT PRIMARY KEY, seed BIGINT NOT NULL, ip_hash TEXT NOT NULL, automated BOOLEAN NOT NULL DEFAULT false,
+      created TIMESTAMPTZ NOT NULL DEFAULT now(), finished TIMESTAMPTZ,
+      email TEXT, steps INTEGER, inputs INTEGER, score INTEGER, verdict TEXT);
+    CREATE INDEX IF NOT EXISTS runs_created ON runs (created);
+    CREATE INDEX IF NOT EXISTS runs_email ON runs (email);
   `);
   await pool.query(`INSERT INTO meta (k, v) VALUES ('salt', $1) ON CONFLICT (k) DO NOTHING`, [crypto.randomBytes(32).toString('hex')]);
   salt = (await pool.query(`SELECT v FROM meta WHERE k = 'salt'`)).rows[0].v;
@@ -60,12 +72,17 @@ const hash = s => crypto.createHmac('sha256', salt).update(s).digest('hex');
 const playerId = email => hash('player:' + email).slice(0, 12);
 
 async function topList() {
-  const { rows } = await pool.query('SELECT email, name, best, country FROM players WHERE best > 0 ORDER BY best DESC, updated ASC LIMIT 10');
+  const { rows } = await pool.query('SELECT email, name, best, country FROM players WHERE best > 0 AND NOT banned ORDER BY best DESC, updated ASC LIMIT 10');
   return rows.map(r => ({ id: playerId(r.email), name: r.name, score: r.best, country: r.country || null }));
 }
 async function visitorCount() {
   return (await pool.query('SELECT COUNT(*)::int AS n FROM visitors')).rows[0].n;
 }
+
+// unfinished runs are only useful for a few hours
+setInterval(() => {
+  pool.query(`DELETE FROM runs WHERE finished IS NULL AND created < now() - interval '1 day'`).catch(err => console.error('run cleanup', err));
+}, 3600e3).unref();
 
 for (const sig of ['SIGINT', 'SIGTERM']) process.on(sig, () => pool.end().finally(() => process.exit(0)));
 
@@ -90,6 +107,7 @@ function clientIp(req) {
 }
 function readJson(req, limit = 2048) {
   return new Promise((resolve, reject) => {
+    if (Number(req.headers['content-length']) > limit) return reject(Object.assign(new Error('too large'), { tooLarge: true }));
     let size = 0;
     const chunks = [];
     req.on('data', c => {
@@ -104,7 +122,17 @@ function readJson(req, limit = 2048) {
 const NAME_RE = /^[\p{L}\p{N} _.\-]{2,16}$/u;
 const EMAIL_RE = /^[^\s@]{1,64}@[^\s@]{1,185}\.[^\s@]{2,}$/;
 const lastSubmit = new Map(); // ip -> ms, simple rate limit
-setInterval(() => { const cut = Date.now() - 60000; for (const [k, t] of lastSubmit) if (t < cut) lastSubmit.delete(k); }, 60000).unref();
+const runStarts = new Map(); // ip -> [window start ms, count]
+setInterval(() => {
+  const cut = Date.now() - 60000;
+  for (const [k, t] of lastSubmit) if (t < cut) lastSubmit.delete(k);
+  for (const [k, w] of runStarts) if (w[0] < cut) runStarts.delete(k);
+}, 60000).unref();
+
+const RUN_TTL = 3 * 3600;                      // seconds a run stays valid
+const MAX_STEPS = 2 * 3600 / Sim.STEP;         // 2 hours of play
+const MAX_INPUTS = 50000;
+const RUNS_PER_MIN = 30;                       // per IP
 
 // records the visitor (hashed IP + country) and returns its hash; `db` is the pool or a transaction client
 async function upsertVisitor(db, req) {
@@ -126,9 +154,9 @@ async function api(req, res, pathname) {
     const limit = Math.min(100, Math.max(1, parseInt(qs.get('limit'), 10) || 50));
     const offset = Math.min(1e6, Math.max(0, parseInt(qs.get('offset'), 10) || 0));
     const [{ rows }, total] = await Promise.all([
-      pool.query(`SELECT email, name, best, country FROM players WHERE best > 0
+      pool.query(`SELECT email, name, best, country FROM players WHERE best > 0 AND NOT banned
                   ORDER BY best DESC, updated ASC LIMIT $1 OFFSET $2`, [limit, offset]),
-      pool.query('SELECT COUNT(*)::int AS n FROM players WHERE best > 0'),
+      pool.query('SELECT COUNT(*)::int AS n FROM players WHERE best > 0 AND NOT banned'),
     ]);
     return json(res, 200, {
       players: rows.map((r, i) => ({ rank: offset + i + 1, id: playerId(r.email), name: r.name, score: r.best, country: r.country || null })),
@@ -152,22 +180,62 @@ async function api(req, res, pathname) {
     return json(res, 200, { visitors: await visitorCount() });
   }
 
+  // start a game: a single-use run with the level seed
+  if (pathname === '/api/run' && req.method === 'POST') {
+    const ip = clientIp(req), now = Date.now();
+    const w = runStarts.get(ip);
+    if (w && now - w[0] < 60000) { if (++w[1] > RUNS_PER_MIN) return json(res, 429, { error: 'Slow down' }); }
+    else runStarts.set(ip, [now, 1]);
+    let body;
+    try { body = await readJson(req); } catch { return json(res, 400, { error: 'Bad JSON' }); }
+    const id = crypto.randomBytes(16).toString('hex'), seed = crypto.randomBytes(4).readUInt32LE(0);
+    await pool.query('INSERT INTO runs (id, seed, ip_hash, automated) VALUES ($1, $2, $3, $4)',
+                     [id, seed, hash('ip:' + ip), body.wd === true]);
+    return json(res, 200, { id, seed, v: Sim.VERSION });
+  }
+
+  // finish a game: replay the inputs on the server; the client's own score is never trusted
   if (pathname === '/api/score' && req.method === 'POST') {
     const ip = clientIp(req), now = Date.now();
-    if (now - (lastSubmit.get(ip) || 0) < 2000) return json(res, 429, { error: 'Slow down' });
+    if (now - (lastSubmit.get(ip) || 0) < 500) return json(res, 429, { error: 'Slow down' });
     lastSubmit.set(ip, now);
 
     let body;
-    try { body = await readJson(req); } catch { return json(res, 400, { error: 'Bad JSON' }); }
+    try { body = await readJson(req, 512 * 1024); } catch (e) { return json(res, e.tooLarge ? 413 : 400, { error: e.tooLarge ? 'Too large' : 'Bad JSON' }); }
     const name = String(body.name || '').trim().replace(/\s+/g, ' ');
     const email = String(body.email || '').trim().toLowerCase();
-    const score = Number(body.score);
-    const duration = Number(body.duration); // seconds of play
+    const runId = String(body.run || ''), steps = body.steps, inputs = body.inputs;
     if (!NAME_RE.test(name)) return json(res, 400, { error: 'Username must be 2–16 letters, numbers, space, _ . -' });
     if (email.length > 254 || !EMAIL_RE.test(email)) return json(res, 400, { error: 'Invalid email' });
-    if (!Number.isInteger(score) || score < 0 || !(duration > 0) || duration > 7200) return json(res, 400, { error: 'Invalid score' });
-    // sanity cap: distance points top out near 100/s, yarn combos add a few hundred/s at most
-    if (score > 60 + duration * 700) return json(res, 400, { error: 'Score rejected' });
+    if (body.v !== Sim.VERSION) return json(res, 409, { error: 'Game updated, reload the page' });
+    if (!/^[0-9a-f]{32}$/.test(runId) || !Number.isInteger(steps) || steps < 1 || steps > MAX_STEPS ||
+        !Array.isArray(inputs) || inputs.length > MAX_INPUTS ||
+        !inputs.every((s, i) => Number.isInteger(s) && s >= 0 && s < steps && (i === 0 || s >= inputs[i - 1]))) {
+      return json(res, 400, { error: 'Invalid run' });
+    }
+
+    // claim the run atomically, so it can't be submitted twice
+    const { rows: [run] } = await pool.query(`
+      UPDATE runs SET finished = now(), email = $2, steps = $3, inputs = $4 WHERE id = $1 AND finished IS NULL
+      RETURNING seed, automated, EXTRACT(EPOCH FROM finished - created)::float8 AS age`, [runId, email, steps, inputs.length]);
+    if (!run) return json(res, 400, { error: 'Run expired or already used' });
+    const reject = async (verdict, error) => {
+      await pool.query('UPDATE runs SET verdict = $2 WHERE id = $1', [runId, verdict]);
+      console.warn(`run ${runId} rejected (${verdict}) for ${playerId(email)}: ${steps} steps, ${inputs.length} inputs`);
+      return json(res, 422, { error });
+    };
+    if (run.age > RUN_TTL) return reject('expired', 'Run expired');
+    if (run.automated) return reject('automated', 'Automated browser');
+    // the run can't have taken less real time than game time (the game is created before it starts)
+    if (run.age < steps * Sim.STEP - 0.5) return reject('too-fast', 'Run too fast');
+    const sim = Sim.replay(Number(run.seed), inputs, steps);
+    if (!sim) return reject('replay', 'Replay check failed');
+    const score = sim.score;
+    await pool.query(`UPDATE runs SET verdict = 'ok', score = $2 WHERE id = $1`, [runId, score]);
+
+    // the browser's key proves ownership of the player; without it scores still count but the name stays
+    const key = /^[0-9a-f]{32}$/.test(body.key) ? body.key : crypto.randomBytes(16).toString('hex');
+    const keyHash = hash('key:' + key);
 
     // player upsert (keeps best score atomically) + visitor + player<->visitor link, all in one transaction
     const db = await pool.connect();
@@ -176,10 +244,13 @@ async function api(req, res, pathname) {
       await db.query('BEGIN');
       prev = await db.query('SELECT best FROM players WHERE email = $1', [email]);
       ({ rows: [row] } = await db.query(`
-        INSERT INTO players (email, name, best, plays, country) VALUES ($1, $2, $3, 1, $4)
-        ON CONFLICT (email) DO UPDATE SET name = excluded.name, best = GREATEST(players.best, excluded.best),
+        INSERT INTO players (email, name, best, plays, country, key_hash) VALUES ($1, $2, $3, 1, $4, $5)
+        ON CONFLICT (email) DO UPDATE SET
+          name = CASE WHEN players.key_hash IS NULL OR players.key_hash = excluded.key_hash THEN excluded.name ELSE players.name END,
+          key_hash = COALESCE(players.key_hash, excluded.key_hash),
+          best = GREATEST(players.best, excluded.best),
           plays = players.plays + 1, updated = now(), country = COALESCE(excluded.country, players.country)
-        RETURNING best`, [email, name, score, clientCountry(req)]));
+        RETURNING best`, [email, name, score, clientCountry(req), keyHash]));
       const ipHash = await upsertVisitor(db, req);
       await db.query(`INSERT INTO player_visitors (email, ip_hash) VALUES ($1, $2)
                       ON CONFLICT (email, ip_hash) DO UPDATE SET plays = player_visitors.plays + 1, last_seen = now()`, [email, ipHash]);
@@ -190,9 +261,9 @@ async function api(req, res, pathname) {
     } finally {
       db.release();
     }
-    const rank = (await pool.query('SELECT COUNT(*)::int + 1 AS r FROM players WHERE best > $1', [row.best])).rows[0].r;
+    const rank = (await pool.query('SELECT COUNT(*)::int + 1 AS r FROM players WHERE best > $1 AND NOT banned', [row.best])).rows[0].r;
     return json(res, 200, {
-      you: playerId(email), best: row.best, rank,
+      you: playerId(email), key, score, best: row.best, rank,
       newRecord: !prev.rows.length || score > prev.rows[0].best, top: await topList(),
     });
   }
@@ -235,6 +306,7 @@ const server = http.createServer((req, res) => {
   } catch {
     return send(res, 400, 'Bad Request');
   }
+  if (pathname.includes('\0')) return send(res, 400, 'Bad Request'); // fs throws on NUL, which used to crash the server
   if (pathname === '/healthz') return send(res, 200, 'ok', { 'Cache-Control': 'no-store' });
   if (pathname.startsWith('/api/')) {
     return api(req, res, pathname).catch(err => {

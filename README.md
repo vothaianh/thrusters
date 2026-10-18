@@ -6,7 +6,8 @@ Live at [truepilot.io](https://truepilot.io).
 
 ## Stack
 
-- `public/index.html` — the whole game (canvas, no build step)
+- `public/index.html` — the game's rendering, sound and UI (canvas, no build step)
+- `public/sim.js` — the deterministic gameplay core, shared by the browser and the server
 - `server.js` — dependency-light Node HTTP server: static files (gzip) plus a leaderboard / visitor API
 - PostgreSQL via [`pg`](https://www.npmjs.com/package/pg); tables are created on startup
 
@@ -41,10 +42,38 @@ Then open http://127.0.0.1:3030.
 | GET    | `/api/players`     | Paged ranking, `?limit=` (≤100) and `?offset=` |
 | GET    | `/api/countries`   | Visitors by country (top 10, others, unknown) |
 | POST   | `/api/visit`       | Record a visit |
-| POST   | `/api/score`       | Submit `{ name, email, score, duration }`; returns best, rank and top 10 |
+| POST   | `/api/run`         | Start a game: returns a single-use run `{ id, seed }` |
+| POST   | `/api/score`       | Finish it: `{ run, name, email, key, inputs, steps, v }`; returns the verified score, best, rank and top 10 |
 | GET    | `/healthz`         | Liveness check |
 
-Score submissions are rate-limited per IP (one per 2 s) and sanity-checked against play duration. IPs are stored only as salted HMAC hashes; player emails are never returned by the API.
+IPs are stored only as salted HMAC hashes; player emails are never returned by the API.
+
+## Anti-cheat
+
+The client never reports a score. Each game is a server-issued run with a secret level seed; the browser records only the
+simulation steps at which the button was pressed, and the server replays those inputs through the same `sim.js` and
+computes the score itself. `sim.js` is bit-for-bit deterministic across JS engines (seeded PRNG, fixed 240 Hz step,
+no `Math.sin`), which is checked against both V8 and JavaScriptCore.
+
+A submission is rejected (and logged with a `verdict` in the `runs` table) when:
+
+- the run is unknown, expired (3 h) or already used — each run counts once
+- the replay doesn't end in a crash at exactly the reported step (`replay`)
+- it took less real time than game time, i.e. it was computed rather than played (`too-fast`)
+- the run came from an automated browser (`navigator.webdriver`) (`automated`)
+- the client is an old version (asks to reload)
+
+The page also ignores synthetic (`isTrusted: false`) input events, and run creation is rate-limited per IP. A random key
+kept in the browser proves ownership of a player, so nobody else can rename it by reusing the email.
+
+To hide a cheater from the leaderboard (reversible):
+
+```sql
+UPDATE players SET banned = true WHERE email = '…';
+SELECT email, verdict, count(*) FROM runs GROUP BY 1, 2 ORDER BY 1;   -- who keeps failing checks
+```
+
+When changing gameplay in `sim.js`, bump `VERSION` there and the `?v=` on its `<script>` tag.
 
 ## Deployment
 
