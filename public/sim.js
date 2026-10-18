@@ -228,11 +228,12 @@ function create(seed, emit = () => {}, demo = false) {
 
 // Re-run a recorded game. inputs: sorted step indices at which the button was pressed.
 // Returns the final state, or null if the inputs don't describe a game that ends exactly at `steps`.
-function replay(seed, inputs, steps) {
+// onPress(g) sees the state just before each press (the server uses it to profile how the run was played).
+function replay(seed, inputs, steps, onPress) {
   const g = create(seed);
   let i = 0;
   while (!g.dead && g.steps < steps) {
-    while (i < inputs.length && inputs[i] === g.steps) { g.press(); i++; }
+    while (i < inputs.length && inputs[i] === g.steps) { if (onPress) onPress(g); g.press(); i++; }
     g.step();
   }
   return g.dead && g.steps === steps && i === inputs.length ? g : null;

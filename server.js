@@ -134,6 +134,50 @@ const MAX_STEPS = 2 * 3600 / Sim.STEP;         // 2 hours of play
 const MAX_INPUTS = 50000;
 const RUNS_PER_MIN = 30;                       // per IP
 
+// ---------- bot defences ----------
+// Cloudflare Turnstile: every run needs a freshly solved (single-use) token (off unless both keys are set)
+const TURNSTILE_SITEKEY = process.env.TURNSTILE_SITEKEY || '';
+const TURNSTILE_SECRET = process.env.TURNSTILE_SECRET || '';
+
+async function verifyTurnstile(token, ip) {
+  const r = await fetch('https://challenges.cloudflare.com/turnstile/v0/siteverify', {
+    method: 'POST',
+    body: new URLSearchParams({ secret: TURNSTILE_SECRET, response: token, remoteip: ip }),
+    signal: AbortSignal.timeout(8000),
+  });
+  return (await r.json()).success === true;
+}
+
+const sd = a => { const m = a.reduce((x, y) => x + y, 0) / a.length; return Math.sqrt(a.reduce((x, y) => x + (y - m) ** 2, 0) / a.length); };
+
+// How a replayed run was played. Returns a verdict when it looks scripted, else null.
+// - holds: ms each press was held. Automation tools press in ~0 ms and identically every time.
+// - reaction: when a press flips the car, how far away the next hazard on its rail was. A script flips at
+//   (almost) the same distance or time every time; people are tens of ms and many pixels apart.
+// Thresholds are deliberately loose so real players are never caught.
+function botVerdict(holds, ahead) {
+  const known = holds.filter(h => h >= 0);
+  if (known.length >= 8) {
+    const sorted = [...known].sort((a, b) => a - b);
+    if (sorted[sorted.length >> 1] < 10 || sorted[sorted.length - 1] - sorted[0] <= 3) return 'bot-input';
+  }
+  if (ahead.length >= 15) {
+    if (sd(ahead.map(a => a.dx)) < 6 || sd(ahead.map(a => a.dt)) < 0.012) return 'bot-reaction';
+  }
+  return null;
+}
+// nearest hazard ahead of the car on the rail it's on (spikes on its side, saws anywhere)
+function hazardAhead(g) {
+  let best = Infinity;
+  for (const o of g.objs) {
+    if (o.broken) continue;
+    const rx = o.x - g.dist;
+    if (o.t === 'spike' && o.side === g.P.dir && rx + o.w > -22) best = Math.min(best, Math.max(0, rx));
+    else if (o.t === 'saw' && rx > -22) best = Math.min(best, Math.max(0, rx));
+  }
+  return best;
+}
+
 // records the visitor (hashed IP + country) and returns its hash; `db` is the pool or a transaction client
 async function upsertVisitor(db, req) {
   const ipHash = hash('ip:' + clientIp(req));
@@ -180,6 +224,10 @@ async function api(req, res, pathname) {
     return json(res, 200, { visitors: await visitorCount() });
   }
 
+  if (pathname === '/api/config' && req.method === 'GET') {
+    return json(res, 200, { turnstile: TURNSTILE_SECRET ? TURNSTILE_SITEKEY : null });
+  }
+
   // start a game: a single-use run with the level seed
   if (pathname === '/api/run' && req.method === 'POST') {
     const ip = clientIp(req), now = Date.now();
@@ -188,6 +236,12 @@ async function api(req, res, pathname) {
     else runStarts.set(ip, [now, 1]);
     let body;
     try { body = await readJson(req); } catch { return json(res, 400, { error: 'Bad JSON' }); }
+    if (TURNSTILE_SECRET) {
+      let ok = false;
+      try { ok = typeof body.token === 'string' && body.token.length < 4096 && await verifyTurnstile(body.token, ip); }
+      catch (err) { console.error('turnstile verify', err.message); return json(res, 503, { error: 'Human check unavailable' }); }
+      if (!ok) return json(res, 403, { error: 'Human check failed' });
+    }
     const id = crypto.randomBytes(16).toString('hex'), seed = crypto.randomBytes(4).readUInt32LE(0);
     await pool.query('INSERT INTO runs (id, seed, ip_hash, automated) VALUES ($1, $2, $3, $4)',
                      [id, seed, hash('ip:' + ip), body.wd === true]);
@@ -205,12 +259,14 @@ async function api(req, res, pathname) {
     const name = String(body.name || '').trim().replace(/\s+/g, ' ');
     const email = String(body.email || '').trim().toLowerCase();
     const runId = String(body.run || ''), steps = body.steps, inputs = body.inputs;
+    const holds = Array.isArray(body.holds) ? body.holds : [];
     if (!NAME_RE.test(name)) return json(res, 400, { error: 'Username must be 2–16 letters, numbers, space, _ . -' });
     if (email.length > 254 || !EMAIL_RE.test(email)) return json(res, 400, { error: 'Invalid email' });
     if (body.v !== Sim.VERSION) return json(res, 409, { error: 'Game updated, reload the page' });
     if (!/^[0-9a-f]{32}$/.test(runId) || !Number.isInteger(steps) || steps < 1 || steps > MAX_STEPS ||
         !Array.isArray(inputs) || inputs.length > MAX_INPUTS ||
-        !inputs.every((s, i) => Number.isInteger(s) && s >= 0 && s < steps && (i === 0 || s >= inputs[i - 1]))) {
+        !inputs.every((s, i) => Number.isInteger(s) && s >= 0 && s < steps && (i === 0 || s >= inputs[i - 1])) ||
+        holds.length !== inputs.length || !holds.every(h => Number.isInteger(h) && h >= -1 && h <= 10000)) {
       return json(res, 400, { error: 'Invalid run' });
     }
 
@@ -228,8 +284,15 @@ async function api(req, res, pathname) {
     if (run.automated) return reject('automated', 'Automated browser');
     // the run can't have taken less real time than game time (the game is created before it starts)
     if (run.age < steps * Sim.STEP - 0.5) return reject('too-fast', 'Run too fast');
-    const sim = Sim.replay(Number(run.seed), inputs, steps);
+    const ahead = [];
+    const sim = Sim.replay(Number(run.seed), inputs, steps, g => {
+      if (!g.P.grounded) return; // presses in mid-air are only buffered
+      const dx = hazardAhead(g);
+      if (dx < 600) ahead.push({ dx, dt: dx / g.speed });
+    });
     if (!sim) return reject('replay', 'Replay check failed');
+    const bot = botVerdict(holds, ahead);
+    if (bot) return reject(bot, 'Bot-like input');
     const score = sim.score;
     await pool.query(`UPDATE runs SET verdict = 'ok', score = $2 WHERE id = $1`, [runId, score]);
 

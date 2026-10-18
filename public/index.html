@@ -34,6 +34,9 @@
   body.poster #lb, body.poster .chip, body.poster #mute, body.poster #countries { display: none !important; }
   #safe { position: fixed; visibility: hidden; pointer-events: none; top: 0; left: 0;
     padding: env(safe-area-inset-top) env(safe-area-inset-right) env(safe-area-inset-bottom) env(safe-area-inset-left); }
+  /* Turnstile human check: only shown when Cloudflare wants a click */
+  #human { position: fixed; left: 50%; bottom: max(16px, env(safe-area-inset-bottom)); transform: translateX(-50%); z-index: 30; display: none; }
+  #human.show { display: block; }
   #mute { position: fixed; right: max(14px, env(safe-area-inset-right)); top: max(12px, env(safe-area-inset-top));
     width: 42px; height: 42px; border-radius: 50%; border: 2px solid #ff4fd8; background: rgba(18,0,43,.6);
     color: #ff4fd8; font: 700 18px/1 system-ui, sans-serif; cursor: pointer; box-shadow: 0 0 14px #ff4fd8aa;
@@ -169,6 +172,7 @@
 </head>
 <body>
 <div id="safe"></div>
+<div id="human"></div>
 <div id="players" role="dialog" aria-modal="true" aria-labelledby="playersTitle" hidden>
   <div class="sheet">
     <div class="sheet-head"><h2 id="playersTitle">ALL PLAYERS</h2><button class="close" type="button" aria-label="Close">✕</button></div>
@@ -490,7 +494,7 @@ async function submitScore() {
     const r = await fetch('/api/score', {
       method: 'POST', headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ run: run.id, name: profile.name, email: profile.email, key: store.get('thrusters.key', ''),
-        inputs, steps: G.steps, v: Sim.VERSION }),
+        inputs, holds, steps: G.steps, v: Sim.VERSION }),
     });
     const d = await r.json();
     if (!r.ok) { submitState = d.error || 'error'; return; }
@@ -683,7 +687,7 @@ function start() {
   nextRun = null;
   fetchRun(); // ready for the next game
   G = Sim.create(run ? run.seed : (Math.random() * 2 ** 32) >>> 0, onSim);
-  inputs = [];
+  inputs = []; holds = [];
   sync();
   state = 'play';
   document.body.classList.add('playing');
@@ -699,16 +703,49 @@ function sync() {
 
 async function fetchRun() {
   try {
+    const token = human.on ? await humanToken() : undefined;
     const r = await fetch('/api/run', {
       method: 'POST', headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ wd: navigator.webdriver === true }),
+      body: JSON.stringify({ wd: navigator.webdriver === true, token }),
     });
     if (!r.ok) return;
     const d = await r.json();
     nextRun = { id: d.id, seed: d.seed, at: Date.now() };
   } catch {}
 }
-fetchRun();
+
+// ---------- human check (Cloudflare Turnstile): one single-use token per game; usually invisible ----------
+const human = { on: false, widget: null, wait: null };
+const humanEl = document.getElementById('human');
+let turnstileReady;
+function humanToken() {
+  return turnstileReady.then(() => new Promise((resolve, reject) => {
+    human.wait = { resolve, reject };
+    if (human.widget === null) {
+      human.widget = turnstile.render(humanEl, {
+        sitekey: human.on, appearance: 'interaction-only', theme: 'dark',
+        callback: t => { humanEl.classList.remove('show'); human.wait?.resolve(t); human.wait = null; },
+        'error-callback': () => { human.wait?.reject(new Error('turnstile')); human.wait = null; },
+        'before-interactive-callback': () => humanEl.classList.add('show'),
+        'after-interactive-callback': () => humanEl.classList.remove('show'),
+      });
+    } else turnstile.reset(human.widget); // tokens are single-use: get a fresh one
+  }));
+}
+(async () => {
+  try {
+    const cfg = await (await fetch('/api/config', { cache: 'no-store' })).json();
+    if (cfg.turnstile) {
+      human.on = cfg.turnstile;
+      turnstileReady = new Promise(resolve => { window.onTurnstileLoad = resolve; });
+      const sc = document.createElement('script');
+      sc.src = 'https://challenges.cloudflare.com/turnstile/v0/api.js?render=explicit&onload=onTurnstileLoad';
+      sc.async = true;
+      document.head.append(sc);
+    }
+  } catch {}
+  fetchRun();
+})();
 
 // visuals and sound for gameplay events from the sim
 function onSim(ev, d) {
@@ -811,17 +848,36 @@ function action() {
   initAudio();
   if (!profile && state !== 'play') return openModal(true);
   if (state === 'menu') start();
-  else if (state === 'play') { inputs.push(G.steps); G.press(); } // recorded for the server's replay
+  else if (state === 'play') { inputs.push(G.steps); holds.push(-1); G.press(); return true; } // recorded for the server's replay
   else if (state === 'dead' && deadT > 0.7) start();
+}
+
+// how long each in-game press is held (ms): automation presses keys in ~0 ms, people don't
+let holds = [];
+const downAt = new Map(); // key code / pointer id -> [press index, timeStamp]
+function pressStart(id, e) { if (action()) downAt.set(id, [holds.length - 1, e.timeStamp, holds]); }
+function pressEnd(id, e) {
+  const d = downAt.get(id);
+  if (!d) return;
+  downAt.delete(id);
+  if (d[2] === holds) holds[d[0]] = Math.min(10000, Math.round(e.timeStamp - d[1]));
 }
 
 // synthetic events (scripts calling dispatchEvent) don't play the game
 addEventListener('keydown', e => {
   if (!e.isTrusted || e.repeat || modalOpen || playersOpen || e.target.closest?.('button, input')) return;
-  if (['Space', 'ArrowUp', 'ArrowDown', 'KeyW', 'KeyS', 'Enter'].includes(e.code)) { e.preventDefault(); action(); }
+  if (['Space', 'ArrowUp', 'ArrowDown', 'KeyW', 'KeyS', 'Enter'].includes(e.code)) { e.preventDefault(); pressStart(e.code, e); }
   else if (e.code === 'KeyM') { initAudio(); setMuted(!muted); }
 });
-cv.addEventListener('pointerdown', e => { e.preventDefault(); if (e.isTrusted) action(); });
+addEventListener('keyup', e => pressEnd(e.code, e));
+// mouse clicks aren't timed: trackpad tap-to-click really does release in ~0 ms
+cv.addEventListener('pointerdown', e => {
+  e.preventDefault();
+  if (!e.isTrusted) return;
+  if (e.pointerType === 'mouse') action(); else pressStart('p' + e.pointerId, e);
+});
+addEventListener('pointerup', e => pressEnd('p' + e.pointerId, e));
+addEventListener('pointercancel', e => pressEnd('p' + e.pointerId, e));
 muteBtn.addEventListener('click', e => { e.stopPropagation(); initAudio(); setMuted(!muted); });
 muteBtn.addEventListener('pointerdown', e => e.stopPropagation());
 addEventListener('resize', resize);

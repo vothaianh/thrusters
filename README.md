@@ -42,8 +42,9 @@ Then open http://127.0.0.1:3030.
 | GET    | `/api/players`     | Paged ranking, `?limit=` (≤100) and `?offset=` |
 | GET    | `/api/countries`   | Visitors by country (top 10, others, unknown) |
 | POST   | `/api/visit`       | Record a visit |
-| POST   | `/api/run`         | Start a game: returns a single-use run `{ id, seed }` |
-| POST   | `/api/score`       | Finish it: `{ run, name, email, key, inputs, steps, v }`; returns the verified score, best, rank and top 10 |
+| GET    | `/api/config`      | Turnstile site key (or null) |
+| POST   | `/api/run`         | Start a game `{ token }` (Turnstile, when enabled): returns a single-use run `{ id, seed }` |
+| POST   | `/api/score`       | Finish it: `{ run, name, email, key, inputs, holds, steps, v }`; returns the verified score, best, rank and top 10 |
 | GET    | `/healthz`         | Liveness check |
 
 IPs are stored only as salted HMAC hashes; player emails are never returned by the API.
@@ -62,6 +63,14 @@ A submission is rejected (and logged with a `verdict` in the `runs` table) when:
 - it took less real time than game time, i.e. it was computed rather than played (`too-fast`)
 - the run came from an automated browser (`navigator.webdriver`) (`automated`)
 - the client is an old version (asks to reload)
+
+- **bot checks** on runs long enough to judge (`bot-input`, `bot-reaction`):
+  - key/touch presses held under ~10 ms, or all held for the same time (automation tools press in ~0 ms)
+  - flips timed at nearly the same distance or time before every hazard (scripted reflexes)
+
+With `TURNSTILE_SITEKEY` and `TURNSTILE_SECRET` in `.env` (a free [Cloudflare Turnstile](https://dash.cloudflare.com/?to=/:account/turnstile)
+widget for the domain), every run also needs a freshly solved Turnstile token, so scripts can't get runs from the API
+without a real browser solving a human check for each game. It's invisible for most players.
 
 The page also ignores synthetic (`isTrusted: false`) input events, and run creation is rate-limited per IP. A random key
 kept in the browser proves ownership of a player, so nobody else can rename it by reusing the email.
